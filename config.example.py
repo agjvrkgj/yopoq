@@ -8,9 +8,16 @@ ADMIN_ID = 123456789
 DOWNLOAD_DIR = "/opt/soop-downloader/downloads"
 LOG_DIR = "/opt/soop-downloader/logs"
 
-# Rclone
-RCLONE_REMOTE = "onedrive"
-RCLONE_DEST = "SOOP_VOD"
+# Rclone - Multiple OneDrive accounts
+# Format: {display_name: {"remote": "rclone_remote_name", "dest": "folder_name"}}
+# Each account needs a separate rclone remote configured via 'rclone config'
+ONEDRIVE_ACCOUNTS = {
+    "主账号": {"remote": "onedrive", "dest": "SOOP_VOD"},
+    # "备用账号": {"remote": "onedrive2", "dest": "SOOP_VOD"},
+}
+
+# Default account
+DEFAULT_ONEDRIVE = "主账号"
 
 # yt-dlp
 YTDLP_FORMAT = "best"

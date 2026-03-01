@@ -55,9 +55,12 @@ SOOP_URL_PATTERN = re.compile(r"https?://vod\.sooplive\.co\.kr/player/(\d+)")
 SOOP_ID_PATTERN = re.compile(r"^(\d{6,})$")
 
 # Queue system
-download_queue: deque = deque()  # [{url, title, chat_id, is_playlist, part_count}]
+download_queue: deque = deque()  # [{url, title, chat_id, is_playlist, part_count, onedrive_account}]
 is_processing = False
 current_task: dict | None = None
+
+# Active OneDrive account (per user, but we only have one admin)
+active_onedrive: str = DEFAULT_ONEDRIVE
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -203,15 +206,19 @@ async def download_video(url: str, progress_callback=None) -> list[str]:
     return filepaths
 
 
-async def upload_to_onedrive(filepath: str, progress_callback=None) -> bool:
+async def upload_to_onedrive(filepath: str, account_name: str = None, progress_callback=None) -> bool:
     """Upload file to OneDrive via rclone."""
     try:
         do_refresh_token()
     except Exception as e:
         logger.warning(f"Token refresh failed: {e}")
 
+    account = ONEDRIVE_ACCOUNTS.get(account_name or active_onedrive, {})
+    remote = account.get("remote", "onedrive")
+    dest_folder = account.get("dest", "SOOP_VOD")
+
     filename = os.path.basename(filepath)
-    dest = f"{RCLONE_REMOTE}:{RCLONE_DEST}/{filename}"
+    dest = f"{remote}:{dest_folder}/{filename}"
 
     cmd = [
         "rclone", "copyto",
@@ -381,7 +388,7 @@ async def queue_worker(app: Application):
                         except Exception:
                             pass
 
-                    success = await upload_to_onedrive(filepath, ul_progress)
+                    success = await upload_to_onedrive(filepath, task.get("onedrive_account"), ul_progress)
 
                     if success:
                         success_count += 1
@@ -393,12 +400,14 @@ async def queue_worker(app: Application):
                 if success_count == len(filepaths):
                     files_list = "\n".join(f"  • {os.path.basename(fp)}" for fp in filepaths)
                     next_info = f"\n\n⏭ 队列剩余: {len(download_queue)}" if download_queue else ""
+                    od_account = task.get("onedrive_account") or active_onedrive
+                    od_dest = ONEDRIVE_ACCOUNTS.get(od_account, {}).get("dest", "SOOP_VOD")
                     await status_msg.edit_text(
                         f"✅ 完成!\n\n"
                         f"标题: {title}\n"
                         f"文件数: {success_count}\n"
                         f"总大小: {human_size(total_size)}\n"
-                        f"OneDrive: {RCLONE_DEST}/\n\n"
+                        f"OneDrive: [{od_account}] {od_dest}/\n\n"
                         f"{files_list}{next_info}"
                     )
                 else:
@@ -435,7 +444,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear - 清空队列\n"
         "/status - 查看当前任务\n"
         "/disk - 查看磁盘空间\n"
-        "/onedrive - 查看 OneDrive 状态",
+        "/onedrive - 查看 OneDrive 状态\n"
+        "/switch - 切换 OneDrive 账号\n"
+        "/accounts - 管理 OneDrive 账号",
     )
 
 
@@ -564,18 +575,21 @@ async def add_to_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
             "chat_id": update.effective_chat.id,
             "is_playlist": False,
             "part_count": 1,
+            "onedrive_account": active_onedrive,
         }
 
         download_queue.append(task)
         pos = len(download_queue)
         processing_text = " (正在处理中)" if is_processing else ""
+        od_label = f"📤 {active_onedrive}"
 
         await status_msg.edit_text(
             f"📥 已加入队列 #{pos}{processing_text}\n\n"
             f"标题: {title}\n"
             f"主播: {uploader}\n"
             f"时长: {duration}\n"
-            f"分辨率: {resolution}"
+            f"分辨率: {resolution}\n"
+            f"{od_label}"
         )
     else:
         playlist_title = videos[0].get("playlist_title") or videos[0].get("title", "Unknown")
@@ -594,23 +608,118 @@ async def add_to_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
             "chat_id": update.effective_chat.id,
             "is_playlist": True,
             "part_count": len(videos),
+            "onedrive_account": active_onedrive,
         }
 
         download_queue.append(task)
         pos = len(download_queue)
         processing_text = " (正在处理中)" if is_processing else ""
+        od_label = f"📤 {active_onedrive}"
 
         await status_msg.edit_text(
             f"📥 已加入队列 #{pos}{processing_text}\n\n"
             f"标题: {playlist_title} ({len(videos)} Parts)\n"
             f"主播: {uploader}\n"
-            f"总时长: {human_duration(total_duration)}\n\n"
+            f"总时长: {human_duration(total_duration)}\n"
+            f"{od_label}\n\n"
             + "\n".join(parts_info)
         )
 
     # Start queue worker if not running
     if not is_processing:
         asyncio.create_task(queue_worker(context.application))
+
+
+async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch active OneDrive account via inline buttons."""
+    global active_onedrive
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not ONEDRIVE_ACCOUNTS:
+        await update.message.reply_text("❌ 没有配置 OneDrive 账号")
+        return
+
+    keyboard = []
+    for name in ONEDRIVE_ACCOUNTS:
+        current = " ✅" if name == active_onedrive else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{name}{current}",
+            callback_data=f"sw_{name}"
+        )])
+
+    await update.message.reply_text(
+        f"☁️ 当前账号: {active_onedrive}\n\n选择要切换的 OneDrive 账号:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all OneDrive accounts and their status."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not ONEDRIVE_ACCOUNTS:
+        await update.message.reply_text("❌ 没有配置 OneDrive 账号\n\n在 config.py 的 ONEDRIVE_ACCOUNTS 中添加")
+        return
+
+    lines = ["☁️ OneDrive 账号列表\n"]
+
+    for name, cfg in ONEDRIVE_ACCOUNTS.items():
+        remote = cfg.get("remote", "")
+        dest = cfg.get("dest", "")
+        is_active = " ✅ (当前)" if name == active_onedrive else ""
+
+        # Check rclone status
+        result = subprocess.run(
+            ["rclone", "about", f"{remote}:"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            # Parse used/total
+            about_lines = result.stdout.strip().split("\n")
+            about_info = " | ".join(l.strip() for l in about_lines[:2])
+            status = f"🟢 {about_info}"
+        else:
+            status = "🔴 未连接"
+
+        lines.append(f"{'─'*30}")
+        lines.append(f"📌 {name}{is_active}")
+        lines.append(f"  Remote: {remote}")
+        lines.append(f"  目标文件夹: {dest}")
+        lines.append(f"  状态: {status}")
+
+    lines.append(f"\n使用 /switch 切换账号")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks."""
+    global active_onedrive
+
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    data = query.data
+
+    # OneDrive switch
+    if data.startswith("sw_"):
+        account_name = data[3:]
+        if account_name in ONEDRIVE_ACCOUNTS:
+            active_onedrive = account_name
+            cfg = ONEDRIVE_ACCOUNTS[account_name]
+            await query.edit_message_text(
+                f"✅ 已切换到: {account_name}\n"
+                f"Remote: {cfg.get('remote', '')}\n"
+                f"目标文件夹: {cfg.get('dest', '')}"
+            )
+        else:
+            await query.edit_message_text(f"❌ 账号不存在: {account_name}")
+        return
 
 
 async def post_init(app: Application):
@@ -620,6 +729,8 @@ async def post_init(app: Application):
         BotCommand("queue", "查看下载队列"),
         BotCommand("clear", "清空队列"),
         BotCommand("status", "查看当前任务"),
+        BotCommand("switch", "切换 OneDrive 账号"),
+        BotCommand("accounts", "管理 OneDrive 账号"),
         BotCommand("disk", "查看磁盘空间"),
         BotCommand("onedrive", "查看 OneDrive 状态"),
     ]
@@ -641,11 +752,15 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("disk", cmd_disk))
     app.add_handler(CommandHandler("onedrive", cmd_onedrive))
+    app.add_handler(CommandHandler("switch", cmd_switch))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
 
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.Regex(SOOP_URL_PATTERN) | filters.Regex(SOOP_ID_PATTERN)),
         handle_url,
     ))
+
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("Bot is running!")
     app.run_polling(drop_pending_updates=True)
