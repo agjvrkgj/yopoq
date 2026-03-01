@@ -15,10 +15,17 @@
 ## 一键部署
 
 ```bash
-# 安装
 bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh)
+```
 
-# 卸载
+运行后选择 `1` 安装或 `2` 卸载。
+
+也可以直接指定：
+```bash
+# 直接安装
+bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) install
+
+# 直接卸载
 bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) uninstall
 ```
 

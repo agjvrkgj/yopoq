@@ -475,10 +475,24 @@ EOF
 # ── 入口 ──────────────────────────────────────────────────
 
 case "${1:-}" in
+    install)
+        install
+        ;;
     uninstall|remove|delete)
         uninstall
         ;;
     *)
-        install
+        print_banner
+        echo "请选择操作:"
+        echo ""
+        echo "  1) 安装"
+        echo "  2) 卸载"
+        echo ""
+        read -p "输入选项 [1/2]: " choice
+        case "$choice" in
+            1) install ;;
+            2) uninstall ;;
+            *) echo "无效选项"; exit 1 ;;
+        esac
         ;;
 esac
