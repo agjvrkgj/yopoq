@@ -247,10 +247,17 @@ PYEOF
         echo ""
         read -p "是否现在配置 Azure App 自动连接？[y/N]: " setup_azure
         if [[ "$setup_azure" =~ ^[Yy]$ ]]; then
-            read -p "Azure 租户 ID: " AZ_TENANT
-            read -p "Azure 应用 ID: " AZ_CLIENT_ID
-            read -p "Azure 客户端密钥: " AZ_CLIENT_SECRET
-            read -p "Microsoft 365 账号: " MS_USER
+            echo ""
+            echo -e "${YELLOW}以下信息在 Azure Portal (portal.azure.com) 获取：${NC}"
+            echo -e "${YELLOW}Azure Portal → Azure Active Directory → 应用注册 → 你的应用${NC}"
+            echo ""
+            read -p "Azure 租户 ID (概述页面的 '目录(租户) ID'): " AZ_TENANT
+            read -p "Azure 应用(客户端) ID (概述页面的 '应用程序(客户端) ID'): " AZ_CLIENT_ID
+            read -p "Azure 客户端密钥 (证书和密钥 → 客户端密钥的 '值'): " AZ_CLIENT_SECRET
+            echo ""
+            echo -e "${YELLOW}以下是你的 Microsoft 365 登录账号：${NC}"
+            echo ""
+            read -p "Microsoft 365 邮箱账号 (如 xxx@xxx.onmicrosoft.com): " MS_USER
             read -s -p "Microsoft 365 密码: " MS_PASS
             echo ""
 
