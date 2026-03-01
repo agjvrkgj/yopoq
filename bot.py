@@ -515,16 +515,19 @@ async def cmd_onedrive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
 
+    account = ONEDRIVE_ACCOUNTS.get(active_onedrive, {})
+    remote = account.get("remote", "onedrive")
+
     result = subprocess.run(
-        ["rclone", "about", f"{RCLONE_REMOTE}:"],
+        ["rclone", "about", f"{remote}:"],
         capture_output=True, text=True, timeout=15,
     )
 
     if result.returncode == 0:
-        await update.message.reply_text(f"☁️ OneDrive 状态\n\n{result.stdout}")
+        await update.message.reply_text(f"☁️ OneDrive 状态 [{active_onedrive}]\n\n{result.stdout}")
     else:
         await update.message.reply_text(
-            f"❌ rclone 未配置或连接失败\n\n{result.stderr}",
+            f"❌ rclone 未配置或连接失败 [{active_onedrive}]\n\n{result.stderr}",
         )
 
 
