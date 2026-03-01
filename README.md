@@ -18,14 +18,17 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh)
 ```
 
-运行后选择 `1` 安装或 `2` 卸载。
+运行后选择操作：
+- `1` 安装
+- `2` 更新（保留配置，更新代码和依赖）
+- `3` 添加 OneDrive 账号
+- `4` 卸载
 
 也可以直接指定：
 ```bash
-# 直接安装
 bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) install
-
-# 直接卸载
+bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) update
+bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) add-onedrive
 bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) uninstall
 ```
 

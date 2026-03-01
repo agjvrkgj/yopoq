@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# SOOP VOD Downloader Bot - 一键安装/卸载脚本
+# SOOP VOD Downloader Bot - 一键管理脚本
+# 支持: 安装 / 卸载 / 更新 / 添加 OneDrive 账号
 #
 
 set -e
@@ -15,6 +16,7 @@ INSTALL_DIR="/opt/soop-downloader"
 SERVICE_NAME="soop-bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REPO_URL="https://github.com/agjvrkgj/yopoq.git"
+RAW_URL="https://raw.githubusercontent.com/agjvrkgj/yopoq/main"
 
 print_banner() {
     echo -e "${CYAN}"
@@ -29,13 +31,222 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "请使用 root 用户运行此脚本"
+        exit 1
+    fi
+}
+
+# ── 下载项目文件 ──────────────────────────────────────────
+
+download_files() {
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${SCRIPT_DIR}/bot.py" ]; then
+        cp "${SCRIPT_DIR}/bot.py" "${INSTALL_DIR}/"
+        cp "${SCRIPT_DIR}/refresh_token.py" "${INSTALL_DIR}/"
+        log_info "从本地复制项目文件"
+    else
+        TMP_DIR=$(mktemp -d)
+        if git clone --depth 1 "$REPO_URL" "$TMP_DIR" 2>/dev/null; then
+            cp "$TMP_DIR"/bot.py "${INSTALL_DIR}/"
+            cp "$TMP_DIR"/refresh_token.py "${INSTALL_DIR}/"
+            rm -rf "$TMP_DIR"
+            log_info "从 GitHub 下载项目文件"
+        else
+            # Fallback to curl
+            curl -fsSL "${RAW_URL}/bot.py" -o "${INSTALL_DIR}/bot.py" || { log_error "下载 bot.py 失败"; exit 1; }
+            curl -fsSL "${RAW_URL}/refresh_token.py" -o "${INSTALL_DIR}/refresh_token.py" || { log_error "下载 refresh_token.py 失败"; exit 1; }
+            [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+            log_info "从 GitHub (curl) 下载项目文件"
+        fi
+    fi
+}
+
+# ── 配置 Azure OneDrive ──────────────────────────────────
+
+setup_azure_onedrive() {
+    local REMOTE_NAME="$1"
+
+    echo ""
+    echo "配置方式："
+    echo "  1. Azure App 自动配置（仅需租户ID、客户端ID、密钥）"
+    echo "  2. Azure App + 账号密码配置（ROPC 模式）"
+    echo "  3. 跳过，稍后手动运行 'rclone config'"
+    echo ""
+    read -p "选择配置方式 [1/2/3]: " azure_mode
+
+    if [[ "$azure_mode" == "3" ]]; then
+        log_warn "请稍后手动运行 'rclone config' 配置 OneDrive"
+        return
+    fi
+
+    if [[ "$azure_mode" != "1" && "$azure_mode" != "2" ]]; then
+        log_warn "无效选项，跳过配置"
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}以下信息在 Azure Portal (portal.azure.com) 获取：${NC}"
+    echo -e "${YELLOW}Azure Portal → Azure Active Directory → 应用注册 → 你的应用${NC}"
+    echo ""
+    read -p "Azure 租户 ID (概述页面的 '目录(租户) ID'): " AZ_TENANT
+    read -p "Azure 应用(客户端) ID (概述页面的 '应用程序(客户端) ID'): " AZ_CLIENT_ID
+    read -p "Azure 客户端密钥 (证书和密钥 → 客户端密钥的 '值'): " AZ_CLIENT_SECRET
+
+    local MS_USER=""
+    local MS_PASS=""
+    local DRIVE_USER_EMAIL=""
+
+    if [[ "$azure_mode" == "2" ]]; then
+        echo ""
+        echo -e "${YELLOW}以下是你的 Microsoft 365 登录账号：${NC}"
+        echo ""
+        read -p "Microsoft 365 邮箱账号 (如 xxx@xxx.onmicrosoft.com): " MS_USER
+        read -s -p "Microsoft 365 密码: " MS_PASS
+        echo ""
+
+        # Write azure config
+        cat > "${INSTALL_DIR}/azure_config_${REMOTE_NAME}.json" << CFGEOF
+{
+    "tenant_id": "${AZ_TENANT}",
+    "client_id": "${AZ_CLIENT_ID}",
+    "client_secret": "${AZ_CLIENT_SECRET}",
+    "username": "${MS_USER}",
+    "password": "${MS_PASS}",
+    "grant_mode": "ropc"
+}
+CFGEOF
+    else
+        echo ""
+        read -p "OneDrive 用户邮箱 (上传到哪个用户的网盘): " DRIVE_USER_EMAIL
+
+        cat > "${INSTALL_DIR}/azure_config_${REMOTE_NAME}.json" << CFGEOF
+{
+    "tenant_id": "${AZ_TENANT}",
+    "client_id": "${AZ_CLIENT_ID}",
+    "client_secret": "${AZ_CLIENT_SECRET}",
+    "grant_mode": "client_credentials",
+    "drive_user": "${DRIVE_USER_EMAIL}"
+}
+CFGEOF
+    fi
+
+    chmod 600 "${INSTALL_DIR}/azure_config_${REMOTE_NAME}.json"
+
+    # For the first/default account, also save as azure_config.json
+    if [[ "$REMOTE_NAME" == "onedrive" ]] || [[ ! -f "${INSTALL_DIR}/azure_config.json" ]]; then
+        cp "${INSTALL_DIR}/azure_config_${REMOTE_NAME}.json" "${INSTALL_DIR}/azure_config.json"
+    fi
+
+    # Generate rclone config section for this remote
+    log_info "正在获取 OneDrive token..."
+
+    python3 << PYEOF
+import requests, json, time, os
+
+with open("${INSTALL_DIR}/azure_config_${REMOTE_NAME}.json") as f:
+    cfg = json.load(f)
+
+tenant = cfg["tenant_id"]
+client_id = cfg["client_id"]
+client_secret = cfg["client_secret"]
+grant_mode = cfg.get("grant_mode", "client_credentials")
+
+url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+if grant_mode == "ropc":
+    data = {
+        "grant_type": "password",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default offline_access",
+        "username": cfg.get("username", ""),
+        "password": cfg.get("password", ""),
+    }
+else:
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+    }
+
+resp = requests.post(url, data=data)
+token = resp.json()
+
+if "access_token" not in token:
+    print(f"[!] Token failed: {token.get('error_description', 'unknown')}")
+    exit(1)
+
+headers = {"Authorization": f"Bearer {token['access_token']}"}
+
+if grant_mode == "ropc":
+    drive_url = "https://graph.microsoft.com/v1.0/me/drive"
+else:
+    drive_user = cfg.get("drive_user", "")
+    drive_url = f"https://graph.microsoft.com/v1.0/users/{drive_user}/drive"
+
+drive_resp = requests.get(drive_url, headers=headers)
+drive_info = drive_resp.json()
+
+if "id" not in drive_info:
+    print(f"[!] Drive error: {drive_info.get('error', {}).get('message', 'unknown')}")
+    exit(1)
+
+rclone_token = {
+    "access_token": token["access_token"],
+    "token_type": "Bearer",
+    "refresh_token": token.get("refresh_token", ""),
+    "expiry": time.strftime("%Y-%m-%dT%H:%M:%S.000000000+00:00",
+                           time.gmtime(time.time() + token.get("expires_in", 3600))),
+}
+
+section = f"""
+[${REMOTE_NAME}]
+type = onedrive
+client_id = {client_id}
+client_secret = {client_secret}
+drive_id = {drive_info['id']}
+drive_type = {drive_info.get('driveType', 'business')}
+token = {json.dumps(rclone_token)}
+"""
+
+conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
+os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+
+# Read existing config, remove old section if exists
+existing = ""
+if os.path.exists(conf_path):
+    with open(conf_path) as f:
+        existing = f.read()
+
+# Remove existing section for this remote
+import re
+pattern = rf"\[${REMOTE_NAME}\][^[]*"
+existing = re.sub(pattern, "", existing).strip()
+
+with open(conf_path, "w") as f:
+    if existing:
+        f.write(existing + "\n")
+    f.write(section)
+
+print(f"[*] ✅ rclone remote '${REMOTE_NAME}' configured")
+PYEOF
+
+    if [ $? -eq 0 ]; then
+        log_info "OneDrive [${REMOTE_NAME}] 配置成功"
+    else
+        log_warn "OneDrive [${REMOTE_NAME}] 配置失败，请稍后手动配置"
+    fi
+}
+
 # ── 卸载 ──────────────────────────────────────────────────
 
 uninstall() {
     print_banner
     echo -e "${YELLOW}开始卸载 SOOP VOD Downloader Bot...${NC}\n"
 
-    # 停止服务
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         log_info "停止服务..."
         systemctl stop "$SERVICE_NAME"
@@ -46,20 +257,17 @@ uninstall() {
         systemctl disable "$SERVICE_NAME"
     fi
 
-    # 删除服务文件
     if [ -f "$SERVICE_FILE" ]; then
         log_info "删除 systemd 服务..."
         rm -f "$SERVICE_FILE"
         systemctl daemon-reload
     fi
 
-    # 删除 crontab
     if crontab -l 2>/dev/null | grep -q "refresh_token"; then
         log_info "删除 token 刷新 cron..."
         crontab -l 2>/dev/null | grep -v "refresh_token" | crontab - 2>/dev/null || true
     fi
 
-    # 删除安装目录
     if [ -d "$INSTALL_DIR" ]; then
         echo ""
         read -p "是否删除安装目录 ${INSTALL_DIR}（包含下载的视频）？[y/N]: " del_dir
@@ -71,7 +279,6 @@ uninstall() {
         fi
     fi
 
-    # 删除 rclone 配置
     echo ""
     read -p "是否删除 rclone 配置（OneDrive 连接信息）？[y/N]: " del_rclone
     if [[ "$del_rclone" =~ ^[Yy]$ ]]; then
@@ -81,28 +288,137 @@ uninstall() {
 
     echo ""
     log_info "✅ 卸载完成！"
+}
+
+# ── 更新 ──────────────────────────────────────────────────
+
+update() {
+    print_banner
+    check_root
+    echo -e "${GREEN}开始更新 SOOP VOD Downloader Bot...${NC}\n"
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        log_error "未检测到安装，请先执行安装"
+        exit 1
+    fi
+
+    # Backup config
+    log_info "备份配置文件..."
+    [ -f "${INSTALL_DIR}/config.py" ] && cp "${INSTALL_DIR}/config.py" "${INSTALL_DIR}/config.py.bak"
+    [ -f "${INSTALL_DIR}/azure_config.json" ] && cp "${INSTALL_DIR}/azure_config.json" "${INSTALL_DIR}/azure_config.json.bak"
+
+    # Download latest files
+    log_info "下载最新版本..."
+    download_files
+
+    # Restore config
+    [ -f "${INSTALL_DIR}/config.py.bak" ] && mv "${INSTALL_DIR}/config.py.bak" "${INSTALL_DIR}/config.py"
+    [ -f "${INSTALL_DIR}/azure_config.json.bak" ] && mv "${INSTALL_DIR}/azure_config.json.bak" "${INSTALL_DIR}/azure_config.json"
+
+    # Update dependencies
+    log_info "更新 Python 依赖..."
+    pip3 install --break-system-packages -q --upgrade yt-dlp python-telegram-bot requests 2>/dev/null || \
+    pip3 install -q --upgrade yt-dlp python-telegram-bot requests
+
+    # Restart service
+    systemctl restart "$SERVICE_NAME"
+
     echo ""
-    echo "以下依赖未卸载（可能被其他程序使用）："
-    echo "  - python3, yt-dlp, ffmpeg, aria2c, rclone"
-    echo "  如需卸载请手动执行："
-    echo "    pip3 uninstall yt-dlp"
-    echo "    apt remove ffmpeg aria2"
-    echo "    rclone 卸载参考: https://rclone.org/uninstall/"
+    log_info "✅ 更新完成！配置文件已保留。"
+    echo ""
+
+    # Show version
+    echo "  yt-dlp 版本: $(yt-dlp --version 2>/dev/null || echo '未知')"
+    echo "  服务状态: $(systemctl is-active $SERVICE_NAME)"
+    echo ""
+}
+
+# ── 添加 OneDrive 账号 ───────────────────────────────────
+
+add_onedrive() {
+    print_banner
+    check_root
+    echo -e "${GREEN}添加 OneDrive 账号${NC}\n"
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        log_error "未检测到安装，请先执行安装"
+        exit 1
+    fi
+
+    # Show existing accounts
+    echo -e "${CYAN}当前已配置的 rclone remotes:${NC}"
+    rclone listremotes 2>/dev/null || echo "  (无)"
+    echo ""
+
+    # Get new account info
+    read -p "新账号的 rclone remote 名称 (如 onedrive2): " NEW_REMOTE
+    if [ -z "$NEW_REMOTE" ]; then
+        log_error "名称不能为空"
+        exit 1
+    fi
+
+    read -p "OneDrive 目标文件夹 [SOOP_VOD]: " NEW_DEST
+    NEW_DEST=${NEW_DEST:-SOOP_VOD}
+
+    # Setup Azure for this remote
+    setup_azure_onedrive "$NEW_REMOTE"
+
+    # Read display name
+    read -p "账号显示名称 (在 Bot 中显示，如 '备用网盘'，回车用 ${NEW_REMOTE}): " DISPLAY_NAME
+    DISPLAY_NAME=${DISPLAY_NAME:-$NEW_REMOTE}
+
+    # Update config.py - add to ONEDRIVE_ACCOUNTS
+    if [ -f "${INSTALL_DIR}/config.py" ]; then
+        # Check if ONEDRIVE_ACCOUNTS exists
+        if grep -q "ONEDRIVE_ACCOUNTS" "${INSTALL_DIR}/config.py"; then
+            # Add new account before the closing brace
+            python3 << PYEOF
+import re
+
+with open("${INSTALL_DIR}/config.py") as f:
+    content = f.read()
+
+# Find ONEDRIVE_ACCOUNTS dict and add new entry
+new_entry = '    "${DISPLAY_NAME}": {"remote": "${NEW_REMOTE}", "dest": "${NEW_DEST}"},'
+pattern = r'(ONEDRIVE_ACCOUNTS\s*=\s*\{[^}]*)'
+match = re.search(pattern, content, re.DOTALL)
+if match:
+    insert_pos = match.end()
+    content = content[:insert_pos] + "\n" + new_entry + content[insert_pos:]
+
+with open("${INSTALL_DIR}/config.py", "w") as f:
+    f.write(content)
+
+print("Config updated")
+PYEOF
+            log_info "已添加到 config.py"
+        else
+            log_warn "config.py 格式不兼容，请手动添加"
+        fi
+    fi
+
+    # Restart bot
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+
+    echo ""
+    log_info "✅ OneDrive 账号 [${DISPLAY_NAME}] 添加完成！"
+    echo ""
+    echo "  Remote 名称: ${NEW_REMOTE}"
+    echo "  目标文件夹: ${NEW_DEST}"
+    echo "  显示名称: ${DISPLAY_NAME}"
+    echo ""
+    echo "  在 Bot 中使用 /switch 切换账号"
+    echo "  使用 /accounts 查看所有账号"
+    echo ""
 }
 
 # ── 安装 ──────────────────────────────────────────────────
 
 install() {
     print_banner
+    check_root
     echo -e "${GREEN}开始安装 SOOP VOD Downloader Bot...${NC}\n"
 
-    # 检查 root
-    if [ "$EUID" -ne 0 ]; then
-        log_error "请使用 root 用户运行此脚本"
-        exit 1
-    fi
-
-    # 检查系统
     if ! command -v apt-get &>/dev/null; then
         log_error "仅支持 Debian/Ubuntu 系统"
         exit 1
@@ -134,25 +450,7 @@ install() {
 
     # ── 5. 获取项目文件 ──
     log_info "下载项目文件..."
-
-    # 如果是从 git clone 运行的，复制本地文件
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "${SCRIPT_DIR}/bot.py" ]; then
-        cp "${SCRIPT_DIR}/bot.py" "${INSTALL_DIR}/"
-        cp "${SCRIPT_DIR}/refresh_token.py" "${INSTALL_DIR}/"
-        log_info "从本地复制项目文件"
-    else
-        # 从 GitHub 下载
-        TMP_DIR=$(mktemp -d)
-        git clone --depth 1 "$REPO_URL" "$TMP_DIR" 2>/dev/null || {
-            log_error "无法从 GitHub 下载，请检查网络连接"
-            exit 1
-        }
-        cp "$TMP_DIR"/bot.py "${INSTALL_DIR}/"
-        cp "$TMP_DIR"/refresh_token.py "${INSTALL_DIR}/"
-        rm -rf "$TMP_DIR"
-        log_info "从 GitHub 下载项目文件"
-    fi
+    download_files
 
     # ── 6. 交互式配置 ──
     echo ""
@@ -233,192 +531,12 @@ PYEOF
 
     log_info "配置文件已生成"
 
-    # ── 8. 生成 refresh_token.py（如果有 Azure 配置） ──
+    # ── 8. OneDrive 配置 ──
     echo ""
     echo -e "${CYAN}═══ OneDrive 配置 ═══${NC}"
-    echo ""
-    echo "OneDrive 需要通过 rclone 配置。"
-    echo ""
 
     if ! rclone about "${RCLONE_REMOTE}:" > /dev/null 2>&1; then
-        echo "rclone 尚未配置 OneDrive。"
-        echo ""
-        echo "配置方式："
-        echo "  1. Azure App 自动配置（仅需租户ID、客户端ID、密钥）"
-        echo "  2. Azure App + 账号密码配置（用于开启了 MFA 但允许 ROPC 的租户）"
-        echo "  3. 手动运行 'rclone config' 配置"
-        echo ""
-        read -p "选择配置方式 [1/2/3]: " azure_mode
-
-        if [[ "$azure_mode" == "1" || "$azure_mode" == "2" ]]; then
-            echo ""
-            echo -e "${YELLOW}以下信息在 Azure Portal (portal.azure.com) 获取：${NC}"
-            echo -e "${YELLOW}Azure Portal → Azure Active Directory → 应用注册 → 你的应用${NC}"
-            echo ""
-            read -p "Azure 租户 ID (概述页面的 '目录(租户) ID'): " AZ_TENANT
-            read -p "Azure 应用(客户端) ID (概述页面的 '应用程序(客户端) ID'): " AZ_CLIENT_ID
-            read -p "Azure 客户端密钥 (证书和密钥 → 客户端密钥的 '值'): " AZ_CLIENT_SECRET
-
-            MS_USER=""
-            MS_PASS=""
-            if [[ "$azure_mode" == "2" ]]; then
-                echo ""
-                echo -e "${YELLOW}以下是你的 Microsoft 365 登录账号：${NC}"
-                echo ""
-                read -p "Microsoft 365 邮箱账号 (如 xxx@xxx.onmicrosoft.com): " MS_USER
-                read -s -p "Microsoft 365 密码: " MS_PASS
-                echo ""
-            fi
-
-            # Determine grant type
-            if [[ -n "$MS_USER" && -n "$MS_PASS" ]]; then
-                GRANT_MODE="ropc"
-            else
-                GRANT_MODE="client_credentials"
-            fi
-
-            cat > "${INSTALL_DIR}/refresh_token.py" << 'PYEOF'
-#!/usr/bin/env python3
-"""Refresh rclone OneDrive token - supports Client Credentials and ROPC."""
-import requests, json, time, os
-
-TENANT_ID = os.environ.get("AZ_TENANT_ID", "")
-CLIENT_ID = os.environ.get("AZ_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("AZ_CLIENT_SECRET", "")
-USERNAME = os.environ.get("AZ_USERNAME", "")
-PASSWORD = os.environ.get("AZ_PASSWORD", "")
-GRANT_MODE = os.environ.get("GRANT_MODE", "client_credentials")
-DRIVE_USER = os.environ.get("DRIVE_USER", "")
-RCLONE_CONF = "/root/.config/rclone/rclone.conf"
-
-_config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "azure_config.json")
-if os.path.exists(_config_file):
-    with open(_config_file) as f:
-        _cfg = json.load(f)
-        TENANT_ID = TENANT_ID or _cfg.get("tenant_id", "")
-        CLIENT_ID = CLIENT_ID or _cfg.get("client_id", "")
-        CLIENT_SECRET = CLIENT_SECRET or _cfg.get("client_secret", "")
-        USERNAME = USERNAME or _cfg.get("username", "")
-        PASSWORD = PASSWORD or _cfg.get("password", "")
-        GRANT_MODE = _cfg.get("grant_mode", GRANT_MODE)
-        DRIVE_USER = _cfg.get("drive_user", DRIVE_USER)
-
-def refresh_token():
-    if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
-        print("[!] Azure credentials not configured, skipping token refresh")
-        return False
-
-    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-
-    if GRANT_MODE == "ropc" and USERNAME and PASSWORD:
-        data = {
-            "grant_type": "password",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "scope": "https://graph.microsoft.com/.default offline_access",
-            "username": USERNAME,
-            "password": PASSWORD,
-        }
-    else:
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "scope": "https://graph.microsoft.com/.default",
-        }
-
-    resp = requests.post(url, data=data)
-    token = resp.json()
-
-    if "access_token" not in token:
-        print(f"[!] Token refresh failed: {token.get('error_description', 'unknown')}")
-        return False
-
-    headers = {"Authorization": f"Bearer {token['access_token']}"}
-
-    # Client credentials uses /users/{id}/drive, ROPC uses /me/drive
-    if GRANT_MODE != "ropc" or not USERNAME:
-        if DRIVE_USER:
-            drive_url = f"https://graph.microsoft.com/v1.0/users/{DRIVE_USER}/drive"
-        else:
-            print("[!] Client credentials mode requires drive_user in azure_config.json")
-            print("[!] Set drive_user to the user's email or ID")
-            return False
-    else:
-        drive_url = "https://graph.microsoft.com/v1.0/me/drive"
-
-    drive_resp = requests.get(drive_url, headers=headers)
-    drive_info = drive_resp.json()
-
-    if "id" not in drive_info:
-        print(f"[!] Failed to get drive info: {drive_info.get('error', {}).get('message', 'unknown')}")
-        return False
-
-    drive_id = drive_info.get("id", "")
-    drive_type = drive_info.get("driveType", "business")
-
-    rclone_token = {
-        "access_token": token["access_token"],
-        "token_type": token.get("token_type", "Bearer"),
-        "refresh_token": token.get("refresh_token", ""),
-        "expiry": time.strftime("%Y-%m-%dT%H:%M:%S.000000000+00:00",
-                               time.gmtime(time.time() + token.get("expires_in", 3600))),
-    }
-
-    config = f"""[onedrive]
-type = onedrive
-client_id = {CLIENT_ID}
-client_secret = {CLIENT_SECRET}
-drive_id = {drive_id}
-drive_type = {drive_type}
-token = {json.dumps(rclone_token)}
-"""
-    os.makedirs(os.path.dirname(RCLONE_CONF), exist_ok=True)
-    with open(RCLONE_CONF, "w") as f:
-        f.write(config)
-    print(f"[*] Token refreshed ({GRANT_MODE}), expires in {token.get('expires_in', '?')}s")
-    return True
-
-if __name__ == "__main__":
-    if refresh_token():
-        print("[*] ✅ Token refresh successful")
-    else:
-        print("[!] ❌ Token refresh failed")
-        exit(1)
-PYEOF
-
-            # Write azure_config.json
-            if [[ "$GRANT_MODE" == "ropc" ]]; then
-                cat > "${INSTALL_DIR}/azure_config.json" << CFGEOF
-{
-    "tenant_id": "${AZ_TENANT}",
-    "client_id": "${AZ_CLIENT_ID}",
-    "client_secret": "${AZ_CLIENT_SECRET}",
-    "username": "${MS_USER}",
-    "password": "${MS_PASS}",
-    "grant_mode": "ropc"
-}
-CFGEOF
-            else
-                echo ""
-                read -p "OneDrive 用户邮箱 (用于指定上传到哪个用户的网盘): " DRIVE_USER_EMAIL
-                cat > "${INSTALL_DIR}/azure_config.json" << CFGEOF
-{
-    "tenant_id": "${AZ_TENANT}",
-    "client_id": "${AZ_CLIENT_ID}",
-    "client_secret": "${AZ_CLIENT_SECRET}",
-    "grant_mode": "client_credentials",
-    "drive_user": "${DRIVE_USER_EMAIL}"
-}
-CFGEOF
-            fi
-
-            chmod 600 "${INSTALL_DIR}/azure_config.json"
-            log_info "正在获取 OneDrive token..."
-            python3 "${INSTALL_DIR}/refresh_token.py" && log_info "OneDrive 配置成功" || log_warn "OneDrive 配置失败，请稍后手动配置"
-        else
-            log_warn "请稍后手动运行 'rclone config' 配置 OneDrive"
-        fi
+        setup_azure_onedrive "$RCLONE_REMOTE"
     else
         log_info "rclone OneDrive 已配置"
     fi
@@ -468,8 +586,6 @@ EOF
     echo "    systemctl stop ${SERVICE_NAME}      # 停止"
     echo "    systemctl restart ${SERVICE_NAME}   # 重启"
     echo ""
-    echo "  卸载: bash install.sh uninstall"
-    echo ""
 }
 
 # ── 入口 ──────────────────────────────────────────────────
@@ -481,17 +597,27 @@ case "${1:-}" in
     uninstall|remove|delete)
         uninstall
         ;;
+    update|upgrade)
+        update
+        ;;
+    add-onedrive|add_onedrive)
+        add_onedrive
+        ;;
     *)
         print_banner
         echo "请选择操作:"
         echo ""
         echo "  1) 安装"
-        echo "  2) 卸载"
+        echo "  2) 更新"
+        echo "  3) 添加 OneDrive 账号"
+        echo "  4) 卸载"
         echo ""
-        read -p "输入选项 [1/2]: " choice
+        read -p "输入选项 [1/2/3/4]: " choice
         case "$choice" in
             1) install ;;
-            2) uninstall ;;
+            2) update ;;
+            3) add_onedrive ;;
+            4) uninstall ;;
             *) echo "无效选项"; exit 1 ;;
         esac
         ;;
