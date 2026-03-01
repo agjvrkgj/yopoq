@@ -567,8 +567,8 @@ EOF
 
     # ── 10. Token 刷新 cron ──
     if [ -f "${INSTALL_DIR}/refresh_token.py" ]; then
-        (crontab -l 2>/dev/null | grep -v refresh_token; echo "0 * * * * /usr/bin/python3 ${INSTALL_DIR}/refresh_token.py >> ${INSTALL_DIR}/logs/token_refresh.log 2>&1") | crontab -
-        log_info "Token 自动刷新已配置（每小时）"
+        (crontab -l 2>/dev/null | grep -v refresh_token; echo "*/45 * * * * /usr/bin/python3 ${INSTALL_DIR}/refresh_token.py >> ${INSTALL_DIR}/logs/token_refresh.log 2>&1") | crontab -
+        log_info "Token 自动刷新已配置（每 45 分钟）"
     fi
 
     # ── 完成 ──
