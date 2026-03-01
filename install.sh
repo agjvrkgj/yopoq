@@ -14,7 +14,7 @@ NC='\033[0m'
 INSTALL_DIR="/opt/soop-downloader"
 SERVICE_NAME="soop-bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-REPO_URL="https://github.com/agjvrkgj/soop-downloader.git"
+REPO_URL="https://github.com/agjvrkgj/yopoq.git"
 
 print_banner() {
     echo -e "${CYAN}"

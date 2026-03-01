@@ -16,16 +16,16 @@
 
 ```bash
 # 安装
-bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/soop-downloader/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh)
 
 # 卸载
-bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/soop-downloader/main/install.sh) uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/agjvrkgj/yopoq/main/install.sh) uninstall
 ```
 
 ## 手动部署
 
 ```bash
-git clone https://github.com/agjvrkgj/soop-downloader.git
+git clone https://github.com/agjvrkgj/yopoq.git
 cd soop-downloader
 bash install.sh
 ```
