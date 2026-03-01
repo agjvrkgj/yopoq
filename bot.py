@@ -440,6 +440,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "支持单视频和多 Part 播放列表\n\n"
         "命令:\n"
         "/start - 显示帮助\n"
+        "/allvod <用户名> - 下载用户全部 VOD\n"
         "/queue - 查看下载队列\n"
         "/clear - 清空队列\n"
         "/status - 查看当前任务\n"
@@ -529,6 +530,109 @@ async def cmd_onedrive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ rclone 未配置或连接失败 [{active_onedrive}]\n\n{result.stderr}",
         )
+
+
+def fetch_user_vods(bjid: str) -> list[dict]:
+    """Fetch all VODs for a SOOP user via API."""
+    import requests as req
+
+    all_vods = []
+    page = 1
+    per_page = 50
+    api_base = f"https://chapi.sooplive.co.kr/api/{bjid}/vods/upload"
+
+    while True:
+        try:
+            resp = req.get(
+                api_base,
+                params={"page": page, "per_page": per_page, "orderby": "reg_date"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            data = resp.json()
+
+            for v in data.get("data", []):
+                vod_id = v.get("title_no")
+                title = v.get("title_name", "Unknown")
+                duration = v.get("ucc", {}).get("total_file_duration", 0)
+                date = v.get("reg_date", "")
+                file_type = v.get("ucc", {}).get("file_type", "")
+                all_vods.append({
+                    "id": vod_id,
+                    "title": title,
+                    "duration": duration,
+                    "date": date,
+                    "type": file_type,
+                })
+
+            meta = data.get("meta", {})
+            if page >= meta.get("last_page", 1):
+                break
+            page += 1
+
+        except Exception as e:
+            logger.error(f"Failed to fetch VODs page {page} for {bjid}: {e}")
+            break
+
+    return all_vods
+
+
+async def cmd_allvod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download all VODs for a SOOP user."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "用法: /allvod <用户名>\n\n"
+            "例: /allvod dancingqueen97\n\n"
+            "会获取该用户所有 VOD 并加入下载队列"
+        )
+        return
+
+    bjid = context.args[0].strip()
+    status_msg = await update.message.reply_text(f"🔍 正在获取 {bjid} 的所有 VOD...")
+
+    vods = await asyncio.get_event_loop().run_in_executor(None, fetch_user_vods, bjid)
+
+    if not vods:
+        await status_msg.edit_text(f"❌ 未找到 {bjid} 的 VOD，请检查用户名是否正确")
+        return
+
+    total_duration = sum(v["duration"] for v in vods)
+
+    # Show summary and ask for confirmation
+    summary = (
+        f"📋 {bjid} 的 VOD 列表\n\n"
+        f"总数: {len(vods)} 个\n"
+        f"总时长: {human_duration(total_duration)}\n\n"
+    )
+
+    # Show first 10 as preview
+    preview_count = min(10, len(vods))
+    for i, v in enumerate(vods[:preview_count], 1):
+        dur = human_duration(v["duration"]) if v["duration"] else "?"
+        summary += f"  {i}. {v['title'][:35]} ({dur})\n"
+
+    if len(vods) > preview_count:
+        summary += f"  ... 还有 {len(vods) - preview_count} 个\n"
+
+    summary += f"\n📤 将上传到: {active_onedrive}"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ 全部下载", callback_data=f"allvod_yes_{bjid}"),
+            InlineKeyboardButton("❌ 取消", callback_data="allvod_no"),
+        ]
+    ]
+
+    # Store vods in context for callback
+    context.bot_data[f"allvod_{bjid}"] = vods
+
+    await status_msg.edit_text(
+        summary,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -724,11 +828,58 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ 账号不存在: {account_name}")
         return
 
+    # All VOD download confirmation
+    if data.startswith("allvod_yes_"):
+        bjid = data[len("allvod_yes_"):]
+        vods = context.bot_data.get(f"allvod_{bjid}", [])
+        if not vods:
+            await query.edit_message_text("❌ VOD 列表已过期，请重新执行 /allvod")
+            return
+
+        await query.edit_message_text(
+            f"🚀 开始批量下载 {bjid} 的 {len(vods)} 个 VOD\n\n"
+            f"所有视频将依次加入队列..."
+        )
+
+        added = 0
+        for v in vods:
+            vod_url = f"https://vod.sooplive.co.kr/player/{v['id']}"
+            task = {
+                "url": vod_url,
+                "title": v["title"],
+                "chat_id": query.message.chat_id,
+                "is_playlist": False,
+                "part_count": 1,
+                "onedrive_account": active_onedrive,
+            }
+            download_queue.append(task)
+            added += 1
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ 已将 {added} 个 VOD 加入队列\n\n"
+                 f"📋 队列总数: {len(download_queue)}\n"
+                 f"📤 上传到: {active_onedrive}",
+        )
+
+        # Clean up stored vods
+        context.bot_data.pop(f"allvod_{bjid}", None)
+
+        # Start queue worker if not running
+        if not is_processing:
+            asyncio.create_task(queue_worker(context.application))
+        return
+
+    if data == "allvod_no":
+        await query.edit_message_text("❌ 已取消批量下载")
+        return
+
 
 async def post_init(app: Application):
     """Set bot commands menu after startup."""
     commands = [
         BotCommand("start", "显示帮助"),
+        BotCommand("allvod", "下载用户全部 VOD"),
         BotCommand("queue", "查看下载队列"),
         BotCommand("clear", "清空队列"),
         BotCommand("status", "查看当前任务"),
@@ -757,6 +908,7 @@ def main():
     app.add_handler(CommandHandler("onedrive", cmd_onedrive))
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
+    app.add_handler(CommandHandler("allvod", cmd_allvod))
 
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.Regex(SOOP_URL_PATTERN) | filters.Regex(SOOP_ID_PATTERN)),
