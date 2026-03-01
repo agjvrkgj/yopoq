@@ -217,9 +217,11 @@ ADMIN_ID = ${ADMIN_ID}
 DOWNLOAD_DIR = "${INSTALL_DIR}/downloads"
 LOG_DIR = "${INSTALL_DIR}/logs"
 
-# Rclone
-RCLONE_REMOTE = "${RCLONE_REMOTE}"
-RCLONE_DEST = "${RCLONE_DEST}"
+# Rclone - Multiple OneDrive accounts
+ONEDRIVE_ACCOUNTS = {
+    "${RCLONE_REMOTE}": {"remote": "${RCLONE_REMOTE}", "dest": "${RCLONE_DEST}"},
+}
+DEFAULT_ONEDRIVE = "${RCLONE_REMOTE}"
 
 # yt-dlp
 YTDLP_FORMAT = "best"
@@ -241,12 +243,14 @@ PYEOF
     if ! rclone about "${RCLONE_REMOTE}:" > /dev/null 2>&1; then
         echo "rclone 尚未配置 OneDrive。"
         echo ""
-        echo "两种配置方式："
-        echo "  1. 手动运行 'rclone config' 配置 OneDrive"
-        echo "  2. 使用 Azure App 凭据自动配置"
+        echo "配置方式："
+        echo "  1. Azure App 自动配置（仅需租户ID、客户端ID、密钥）"
+        echo "  2. Azure App + 账号密码配置（用于开启了 MFA 但允许 ROPC 的租户）"
+        echo "  3. 手动运行 'rclone config' 配置"
         echo ""
-        read -p "是否现在配置 Azure App 自动连接？[y/N]: " setup_azure
-        if [[ "$setup_azure" =~ ^[Yy]$ ]]; then
+        read -p "选择配置方式 [1/2/3]: " azure_mode
+
+        if [[ "$azure_mode" == "1" || "$azure_mode" == "2" ]]; then
             echo ""
             echo -e "${YELLOW}以下信息在 Azure Portal (portal.azure.com) 获取：${NC}"
             echo -e "${YELLOW}Azure Portal → Azure Active Directory → 应用注册 → 你的应用${NC}"
@@ -254,44 +258,102 @@ PYEOF
             read -p "Azure 租户 ID (概述页面的 '目录(租户) ID'): " AZ_TENANT
             read -p "Azure 应用(客户端) ID (概述页面的 '应用程序(客户端) ID'): " AZ_CLIENT_ID
             read -p "Azure 客户端密钥 (证书和密钥 → 客户端密钥的 '值'): " AZ_CLIENT_SECRET
-            echo ""
-            echo -e "${YELLOW}以下是你的 Microsoft 365 登录账号：${NC}"
-            echo ""
-            read -p "Microsoft 365 邮箱账号 (如 xxx@xxx.onmicrosoft.com): " MS_USER
-            read -s -p "Microsoft 365 密码: " MS_PASS
-            echo ""
 
-            cat > "${INSTALL_DIR}/refresh_token.py" << PYEOF
+            MS_USER=""
+            MS_PASS=""
+            if [[ "$azure_mode" == "2" ]]; then
+                echo ""
+                echo -e "${YELLOW}以下是你的 Microsoft 365 登录账号：${NC}"
+                echo ""
+                read -p "Microsoft 365 邮箱账号 (如 xxx@xxx.onmicrosoft.com): " MS_USER
+                read -s -p "Microsoft 365 密码: " MS_PASS
+                echo ""
+            fi
+
+            # Determine grant type
+            if [[ -n "$MS_USER" && -n "$MS_PASS" ]]; then
+                GRANT_MODE="ropc"
+            else
+                GRANT_MODE="client_credentials"
+            fi
+
+            cat > "${INSTALL_DIR}/refresh_token.py" << 'PYEOF'
 #!/usr/bin/env python3
-"""Refresh rclone OneDrive token via ROPC."""
-import requests, json, time
+"""Refresh rclone OneDrive token - supports Client Credentials and ROPC."""
+import requests, json, time, os
 
-TENANT_ID = "${AZ_TENANT}"
-CLIENT_ID = "${AZ_CLIENT_ID}"
-CLIENT_SECRET = "${AZ_CLIENT_SECRET}"
-USERNAME = "${MS_USER}"
-PASSWORD = "${MS_PASS}"
+TENANT_ID = os.environ.get("AZ_TENANT_ID", "")
+CLIENT_ID = os.environ.get("AZ_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("AZ_CLIENT_SECRET", "")
+USERNAME = os.environ.get("AZ_USERNAME", "")
+PASSWORD = os.environ.get("AZ_PASSWORD", "")
+GRANT_MODE = os.environ.get("GRANT_MODE", "client_credentials")
+DRIVE_USER = os.environ.get("DRIVE_USER", "")
 RCLONE_CONF = "/root/.config/rclone/rclone.conf"
 
+_config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "azure_config.json")
+if os.path.exists(_config_file):
+    with open(_config_file) as f:
+        _cfg = json.load(f)
+        TENANT_ID = TENANT_ID or _cfg.get("tenant_id", "")
+        CLIENT_ID = CLIENT_ID or _cfg.get("client_id", "")
+        CLIENT_SECRET = CLIENT_SECRET or _cfg.get("client_secret", "")
+        USERNAME = USERNAME or _cfg.get("username", "")
+        PASSWORD = PASSWORD or _cfg.get("password", "")
+        GRANT_MODE = _cfg.get("grant_mode", GRANT_MODE)
+        DRIVE_USER = _cfg.get("drive_user", DRIVE_USER)
+
 def refresh_token():
+    if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
+        print("[!] Azure credentials not configured, skipping token refresh")
+        return False
+
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "password",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default offline_access",
-        "username": USERNAME,
-        "password": PASSWORD,
-    }
+
+    if GRANT_MODE == "ropc" and USERNAME and PASSWORD:
+        data = {
+            "grant_type": "password",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default offline_access",
+            "username": USERNAME,
+            "password": PASSWORD,
+        }
+    else:
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+
     resp = requests.post(url, data=data)
     token = resp.json()
+
     if "access_token" not in token:
         print(f"[!] Token refresh failed: {token.get('error_description', 'unknown')}")
         return False
 
     headers = {"Authorization": f"Bearer {token['access_token']}"}
-    drive_resp = requests.get("https://graph.microsoft.com/v1.0/me/drive", headers=headers)
+
+    # Client credentials uses /users/{id}/drive, ROPC uses /me/drive
+    if GRANT_MODE != "ropc" or not USERNAME:
+        if DRIVE_USER:
+            drive_url = f"https://graph.microsoft.com/v1.0/users/{DRIVE_USER}/drive"
+        else:
+            print("[!] Client credentials mode requires drive_user in azure_config.json")
+            print("[!] Set drive_user to the user's email or ID")
+            return False
+    else:
+        drive_url = "https://graph.microsoft.com/v1.0/me/drive"
+
+    drive_resp = requests.get(drive_url, headers=headers)
     drive_info = drive_resp.json()
+
+    if "id" not in drive_info:
+        print(f"[!] Failed to get drive info: {drive_info.get('error', {}).get('message', 'unknown')}")
+        return False
+
     drive_id = drive_info.get("id", "")
     drive_type = drive_info.get("driveType", "business")
 
@@ -311,11 +373,10 @@ drive_id = {drive_id}
 drive_type = {drive_type}
 token = {json.dumps(rclone_token)}
 """
-    import os
     os.makedirs(os.path.dirname(RCLONE_CONF), exist_ok=True)
     with open(RCLONE_CONF, "w") as f:
         f.write(config)
-    print(f"[*] Token refreshed, expires in {token.get('expires_in', '?')}s")
+    print(f"[*] Token refreshed ({GRANT_MODE}), expires in {token.get('expires_in', '?')}s")
     return True
 
 if __name__ == "__main__":
@@ -326,6 +387,33 @@ if __name__ == "__main__":
         exit(1)
 PYEOF
 
+            # Write azure_config.json
+            if [[ "$GRANT_MODE" == "ropc" ]]; then
+                cat > "${INSTALL_DIR}/azure_config.json" << CFGEOF
+{
+    "tenant_id": "${AZ_TENANT}",
+    "client_id": "${AZ_CLIENT_ID}",
+    "client_secret": "${AZ_CLIENT_SECRET}",
+    "username": "${MS_USER}",
+    "password": "${MS_PASS}",
+    "grant_mode": "ropc"
+}
+CFGEOF
+            else
+                echo ""
+                read -p "OneDrive 用户邮箱 (用于指定上传到哪个用户的网盘): " DRIVE_USER_EMAIL
+                cat > "${INSTALL_DIR}/azure_config.json" << CFGEOF
+{
+    "tenant_id": "${AZ_TENANT}",
+    "client_id": "${AZ_CLIENT_ID}",
+    "client_secret": "${AZ_CLIENT_SECRET}",
+    "grant_mode": "client_credentials",
+    "drive_user": "${DRIVE_USER_EMAIL}"
+}
+CFGEOF
+            fi
+
+            chmod 600 "${INSTALL_DIR}/azure_config.json"
             log_info "正在获取 OneDrive token..."
             python3 "${INSTALL_DIR}/refresh_token.py" && log_info "OneDrive 配置成功" || log_warn "OneDrive 配置失败，请稍后手动配置"
         else
