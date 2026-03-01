@@ -1,0 +1,15 @@
+# Sensitive files
+config.py
+azure_config.json
+*.log
+
+# Runtime
+downloads/
+logs/
+__pycache__/
+*.pyc
+
+# Dev files
+oauth_setup.py
+get_token.py
+soop-bot.service
