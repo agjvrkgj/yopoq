@@ -299,6 +299,42 @@ async def remux_video(filepath: str, progress_callback=None) -> str:
         return filepath
 
 
+from telegram.error import RetryAfter, TimedOut, NetworkError
+
+
+# ── Safe Telegram messaging (handles flood control) ──────────────────────
+
+async def safe_send(bot, chat_id: int, text: str, **kwargs):
+    """Send message with RetryAfter handling."""
+    for attempt in range(3):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except RetryAfter as e:
+            wait = min(e.retry_after, 60)
+            logger.warning(f"Flood control, waiting {wait}s...")
+            await asyncio.sleep(wait + 1)
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network error sending message: {e}")
+            await asyncio.sleep(5)
+    return None
+
+
+async def safe_edit(msg, text: str, **kwargs):
+    """Edit message with RetryAfter handling."""
+    if msg is None:
+        return
+    for attempt in range(3):
+        try:
+            await msg.edit_text(text, **kwargs)
+            return
+        except RetryAfter as e:
+            wait = min(e.retry_after, 60)
+            logger.warning(f"Flood control on edit, waiting {wait}s...")
+            await asyncio.sleep(wait + 1)
+        except Exception:
+            return
+
+
 # ── Queue Worker ─────────────────────────────────────────────────────────
 
 async def queue_worker(app: Application):
@@ -328,37 +364,34 @@ async def queue_worker(app: Application):
             queue_info = f"\n📋 队列剩余: {queue_remaining}" if queue_remaining > 0 else ""
             label = f"{title} ({part_count} Parts)" if is_playlist else title
 
-            status_msg = await app.bot.send_message(
-                chat_id=chat_id,
-                text=f"⬇️ 开始下载\n\n{label}{queue_info}",
+            status_msg = await safe_send(
+                app.bot, chat_id,
+                f"⬇️ 开始下载\n\n{label}{queue_info}",
             )
 
             try:
                 # ── Download ──
                 last_text = [""]
+                last_edit_time = [0]
 
                 async def dl_progress(text: str):
-                    if text != last_text[0]:
+                    now = time.time()
+                    if text != last_text[0] and now - last_edit_time[0] >= 5:
                         last_text[0] = text
-                        try:
-                            await status_msg.edit_text(f"{text}\n\n{label}{queue_info}")
-                        except Exception:
-                            pass
+                        last_edit_time[0] = now
+                        await safe_edit(status_msg, f"{text}\n\n{label}{queue_info}")
 
                 filepaths = await download_video(url, dl_progress)
 
                 if not filepaths:
-                    await status_msg.edit_text(f"❌ 下载失败\n\n{label}")
+                    await safe_edit(status_msg, f"❌ 下载失败\n\n{label}")
                     continue
 
                 # ── Remux ──
                 for i, fp in enumerate(filepaths):
                     if os.path.exists(fp):
                         part_label = f" ({i+1}/{len(filepaths)})" if len(filepaths) > 1 else ""
-                        try:
-                            await status_msg.edit_text(f"🔧 修复视频封装{part_label}...\n\n{label}")
-                        except Exception:
-                            pass
+                        await safe_edit(status_msg, f"🔧 修复视频封装{part_label}...\n\n{label}")
                         filepaths[i] = await remux_video(fp)
 
                 total_size = sum(os.path.getsize(fp) for fp in filepaths if os.path.exists(fp))
@@ -372,21 +405,20 @@ async def queue_worker(app: Application):
                     file_size = os.path.getsize(filepath)
                     file_label = f"({i}/{len(filepaths)}) " if len(filepaths) > 1 else ""
 
-                    await status_msg.edit_text(
+                    await safe_edit(
+                        status_msg,
                         f"☁️ 上传到 OneDrive {file_label}\n\n"
                         f"{os.path.basename(filepath)}\n"
                         f"文件大小: {human_size(file_size)}{queue_info}"
                     )
 
                     async def ul_progress(text: str):
-                        try:
-                            await status_msg.edit_text(
-                                f"{text} {file_label}\n\n"
-                                f"{os.path.basename(filepath)}\n"
-                                f"文件大小: {human_size(file_size)}{queue_info}"
-                            )
-                        except Exception:
-                            pass
+                        await safe_edit(
+                            status_msg,
+                            f"{text} {file_label}\n\n"
+                            f"{os.path.basename(filepath)}\n"
+                            f"文件大小: {human_size(file_size)}{queue_info}"
+                        )
 
                     success = await upload_to_onedrive(filepath, task.get("onedrive_account"), ul_progress)
 
@@ -402,7 +434,8 @@ async def queue_worker(app: Application):
                     next_info = f"\n\n⏭ 队列剩余: {len(download_queue)}" if download_queue else ""
                     od_account = task.get("onedrive_account") or active_onedrive
                     od_dest = ONEDRIVE_ACCOUNTS.get(od_account, {}).get("dest", "SOOP_VOD")
-                    await status_msg.edit_text(
+                    await safe_edit(
+                        status_msg,
                         f"✅ 完成!\n\n"
                         f"标题: {title}\n"
                         f"文件数: {success_count}\n"
@@ -411,16 +444,14 @@ async def queue_worker(app: Application):
                         f"{files_list}{next_info}"
                     )
                 else:
-                    await status_msg.edit_text(
+                    await safe_edit(
+                        status_msg,
                         f"⚠️ 部分完成 ({success_count}/{len(filepaths)})\n\n{title}"
                     )
 
             except Exception as e:
                 logger.exception(f"Pipeline error for {url}")
-                try:
-                    await status_msg.edit_text(f"❌ 出错了\n\n{str(e)}")
-                except Exception:
-                    pass
+                await safe_edit(status_msg, f"❌ 出错了\n\n{str(e)[:200]}")
 
     finally:
         current_task = None
@@ -465,7 +496,10 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if download_queue:
         lines.append(f"\n📋 队列 ({len(download_queue)} 个):")
         for i, task in enumerate(download_queue, 1):
-            lines.append(f"  {i}. {task.get('title', '未知')}")
+            if i <= 10:
+                lines.append(f"  {i}. {task.get('title', '未知')}")
+        if len(download_queue) > 10:
+            lines.append(f"  ... 还有 {len(download_queue) - 10} 个")
     else:
         lines.append("\n📋 队列为空")
 
